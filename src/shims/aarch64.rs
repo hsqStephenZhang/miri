@@ -169,8 +169,75 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(Scalar::from_uint(hi, Size::from_bytes(8)), &dest1)?;
             }
 
+            // AES single round encryption: `vaeseq_u8(data, key)`
+            // LLVM name: llvm.aarch64.crypto.aese
+            "crypto.aese" => {
+                this.expect_target_feature_for_intrinsic(link_name, "aes")?;
+                let [state, key] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+
+                aes_round(this, state, key, dest, |state, key| {
+                    let key = aes::Block::from(key.to_le_bytes());
+                    let mut state = aes::Block::from(state.to_le_bytes());
+                    // Same semantics as x86 AESENC round.
+                    aes::hazmat::cipher_round(&mut state, &key);
+                    u128::from_le_bytes(state.into())
+                })?;
+            }
+
+            // AES single round decryption: `vaesdq_u8(data, key)`
+            // LLVM name: llvm.aarch64.crypto.aesd
+            "crypto.aesd" => {
+                this.expect_target_feature_for_intrinsic(link_name, "aes")?;
+                let [state, key] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+
+                aes_round(this, state, key, dest, |state, key| {
+                    let key = aes::Block::from(key.to_le_bytes());
+                    let mut state = aes::Block::from(state.to_le_bytes());
+                    // Same semantics as x86 AESDEC round.
+                    aes::hazmat::equiv_inv_cipher_round(&mut state, &key);
+                    u128::from_le_bytes(state.into())
+                })?;
+            }
+
             _ => return interp_ok(EmulateItemResult::NotSupported),
         }
         interp_ok(EmulateItemResult::NeedsReturn)
     }
+}
+
+// Performs an AES round (given by `f`) on each 128-bit word of
+// `state` with the corresponding 128-bit key of `key`.
+fn aes_round<'tcx>(
+    ecx: &mut crate::MiriInterpCx<'tcx>,
+    state: &OpTy<'tcx>,
+    key: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
+    f: impl Fn(u128, u128) -> u128,
+) -> InterpResult<'tcx, ()> {
+    assert_eq!(dest.layout.size, state.layout.size);
+    assert_eq!(dest.layout.size, key.layout.size);
+
+    // Transmute arguments to arrays of `u128`.
+    assert_eq!(dest.layout.size.bytes() % 16, 0);
+    let len = dest.layout.size.bytes() / 16;
+
+    let u128_array_layout = ecx.layout_of(Ty::new_array(ecx.tcx.tcx, ecx.tcx.types.u128, len))?;
+
+    let state = state.transmute(u128_array_layout, ecx)?;
+    let key = key.transmute(u128_array_layout, ecx)?;
+    let dest = dest.transmute(u128_array_layout, ecx)?;
+
+    for i in 0..len {
+        let state = ecx.read_scalar(&ecx.project_index(&state, i)?)?.to_u128()?;
+        let key = ecx.read_scalar(&ecx.project_index(&key, i)?)?.to_u128()?;
+        let dest = ecx.project_index(&dest, i)?;
+
+        let res = f(state, key);
+
+        ecx.write_scalar(Scalar::from_u128(res), &dest)?;
+    }
+
+    interp_ok(())
 }
