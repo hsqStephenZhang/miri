@@ -20,6 +20,7 @@ use super::alloc::EvalContextExt as _;
 use super::backtrace::EvalContextExt as _;
 use crate::concurrency::GenmcEvalContextExt as _;
 use crate::helpers::EvalContextExt as _;
+use crate::helpers::{ToHost, ToSoft};
 use crate::*;
 
 /// Type of dynamic symbols (for `dlsym` et al)
@@ -829,6 +830,85 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         Scalar::from_uint(res, op.layout.size),
                         &this.project_index(&dest, i)?,
                     )?;
+                }
+            }
+
+            // Generic fused multiply-add: supports both vector forms `v2f64`, `v4f32` (and scalar fallback if needed).
+            name if name.starts_with("llvm.fma.") => {
+                let [a, b, c] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+
+                // If destination is a SIMD vector, operate lane-wise; otherwise treat as scalar float.
+                if dest.layout.ty.is_simd() {
+                    let (a, a_len) = this.project_to_simd(a)?;
+                    let (b, b_len) = this.project_to_simd(b)?;
+                    let (c, c_len) = this.project_to_simd(c)?;
+                    let (dest, dest_len) = this.project_to_simd(dest)?;
+
+                    assert_eq!(a_len, b_len);
+                    assert_eq!(b_len, c_len);
+                    assert_eq!(c_len, dest_len);
+
+                    // Determine element float type from dest lane type.
+                    let (_len, elem_ty) = dest.layout.ty.simd_size_and_type(*this.tcx);
+                    match elem_ty.kind() {
+                        ty::Float(ty::FloatTy::F32) => {
+                            for i in 0..dest_len {
+                                let av = this.read_immediate(&this.project_index(&a, i)?)?;
+                                let bv = this.read_immediate(&this.project_index(&b, i)?)?;
+                                let cv = this.read_immediate(&this.project_index(&c, i)?)?;
+                                let a32 = av.to_scalar().to_f32()?;
+                                let b32 = bv.to_scalar().to_f32()?;
+                                let c32 = cv.to_scalar().to_f32()?;
+                                let res = a32.to_host().mul_add(b32.to_host(), c32.to_host()).to_soft();
+                                let res = this.adjust_nan(res, &[a32, b32, c32]);
+                                this.write_scalar(Scalar::from(res), &this.project_index(&dest, i)?)?;
+                            }
+                        }
+                        ty::Float(ty::FloatTy::F64) => {
+                            for i in 0..dest_len {
+                                let av = this.read_immediate(&this.project_index(&a, i)?)?;
+                                let bv = this.read_immediate(&this.project_index(&b, i)?)?;
+                                let cv = this.read_immediate(&this.project_index(&c, i)?)?;
+                                let a64 = av.to_scalar().to_f64()?;
+                                let b64 = bv.to_scalar().to_f64()?;
+                                let c64 = cv.to_scalar().to_f64()?;
+                                let res = a64.to_host().mul_add(b64.to_host(), c64.to_host()).to_soft();
+                                let res = this.adjust_nan(res, &[a64, b64, c64]);
+                                this.write_scalar(Scalar::from(res), &this.project_index(&dest, i)?)?;
+                            }
+                        }
+                        _ => throw_unsup_format!(
+                            "unsupported element type for llvm.fma: {}",
+                            elem_ty
+                        ),
+                    }
+                } else {
+                    // Scalar float case: llvm.fma.f32 / llvm.fma.f64 if ever encountered.
+                    let av = this.read_immediate(a)?;
+                    let bv = this.read_immediate(b)?;
+                    let cv = this.read_immediate(c)?;
+                    match dest.layout.ty.kind() {
+                        ty::Float(ty::FloatTy::F32) => {
+                            let a32 = av.to_scalar().to_f32()?;
+                            let b32 = bv.to_scalar().to_f32()?;
+                            let c32 = cv.to_scalar().to_f32()?;
+                            let res = a32.to_host().mul_add(b32.to_host(), c32.to_host()).to_soft();
+                            let res = this.adjust_nan(res, &[a32, b32, c32]);
+                            this.write_scalar(Scalar::from(res), dest)?;
+                        }
+                        ty::Float(ty::FloatTy::F64) => {
+                            let a64 = av.to_scalar().to_f64()?;
+                            let b64 = bv.to_scalar().to_f64()?;
+                            let c64 = cv.to_scalar().to_f64()?;
+                            let res = a64.to_host().mul_add(b64.to_host(), c64.to_host()).to_soft();
+                            let res = this.adjust_nan(res, &[a64, b64, c64]);
+                            this.write_scalar(Scalar::from(res), dest)?;
+                        }
+                        _ => throw_unsup_format!(
+                            "unsupported destination type for llvm.fma: {}",
+                            dest.layout.ty
+                        ),
+                    }
                 }
             }
 
