@@ -77,7 +77,8 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     let idx = this.read_immediate(&this.project_index(&indices, i)?)?;
                     let idx_u = idx.to_scalar().to_uint(elem_size)? as u8;
                     let val = if (idx_u as usize) < table_len as usize {
-                        let t = this.read_immediate(&this.project_index(&table, u64::from(idx_u))?)?;
+                        let t =
+                            this.read_immediate(&this.project_index(&table, u64::from(idx_u))?)?;
                         t.to_scalar()
                     } else {
                         Scalar::from_u8(0)
@@ -97,7 +98,9 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 for i in 0..op_len {
                     let v = this.read_immediate(&this.project_index(&op, i)?)?;
                     let u = v.to_scalar().to_uint(size)?;
-                    if u < min_val { min_val = u; }
+                    if u < min_val {
+                        min_val = u;
+                    }
                 }
                 this.write_scalar(Scalar::from_uint(min_val, size), dest)?;
             }
@@ -111,7 +114,9 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 for i in 0..op_len {
                     let v = this.read_immediate(&this.project_index(&op, i)?)?;
                     let u = v.to_scalar().to_uint(size)?;
-                    if u < min_val { min_val = u; }
+                    if u < min_val {
+                        min_val = u;
+                    }
                 }
                 this.write_scalar(Scalar::from_uint(min_val, size), dest)?;
             }
@@ -125,7 +130,9 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 for i in 0..op_len {
                     let v = this.read_immediate(&this.project_index(&op, i)?)?;
                     let u = v.to_scalar().to_uint(size)?;
-                    if u < min_val { min_val = u; }
+                    if u < min_val {
+                        min_val = u;
+                    }
                 }
                 this.write_scalar(Scalar::from_uint(min_val, size), dest)?;
             }
@@ -169,36 +176,120 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(Scalar::from_uint(hi, Size::from_bytes(8)), &dest1)?;
             }
 
-            // AES single round encryption: `vaeseq_u8(data, key)`
-            // LLVM name: llvm.aarch64.crypto.aese
+            // AES: MixColumns only (AESMC). Operates on each 128-bit chunk.
+            // https://developer.arm.com/architectures/instruction-sets/intrinsics/vaesmcq_u8
+            name @ "crypto.aesmc" => {
+                this.expect_target_feature_for_intrinsic(link_name, "aes")?;
+                let [op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+
+                assert_eq!(dest.layout.size, op.layout.size);
+                let len = dest.layout.size.bytes() / 16;
+                assert!(dest.layout.size.bytes() % 16 == 0, "{name} expects 128-bit chunks");
+
+                let u128_array_layout =
+                    this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u128, len))?;
+                let op = op.transmute(u128_array_layout, this)?;
+                let dest = dest.transmute(u128_array_layout, this)?;
+
+                for i in 0..len {
+                    let v = this.read_scalar(&this.project_index(&op, i)?)?.to_u128()?;
+                    let mut state = aes::Block::from(v.to_le_bytes());
+                    aes::hazmat::mix_columns(&mut state);
+                    this.write_scalar(
+                        Scalar::from_u128(u128::from_le_bytes(state.into())),
+                        &this.project_index(&dest, i)?,
+                    )?;
+                }
+            }
+
+            // AES: InvMixColumns only (AESIMC). Operates on each 128-bit chunk.
+            // https://developer.arm.com/architectures/instruction-sets/intrinsics/vaesimcq_u8
+            name @ "crypto.aesimc" => {
+                this.expect_target_feature_for_intrinsic(link_name, "aes")?;
+                let [op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+
+                assert_eq!(dest.layout.size, op.layout.size);
+                let len = dest.layout.size.bytes() / 16;
+                assert!(dest.layout.size.bytes() % 16 == 0, "{name} expects 128-bit chunks");
+
+                let u128_array_layout =
+                    this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u128, len))?;
+                let op = op.transmute(u128_array_layout, this)?;
+                let dest = dest.transmute(u128_array_layout, this)?;
+
+                for i in 0..len {
+                    let v = this.read_scalar(&this.project_index(&op, i)?)?.to_u128()?;
+                    let mut state = aes::Block::from(v.to_le_bytes());
+                    aes::hazmat::inv_mix_columns(&mut state);
+                    this.write_scalar(
+                        Scalar::from_u128(u128::from_le_bytes(state.into())),
+                        &this.project_index(&dest, i)?,
+                    )?;
+                }
+            }
+
+            // AES: AESE (SubBytes + ShiftRows + AddRoundKey, without MixColumns).
+            // Combined with AESMC equals a full encryption round.
+            // https://developer.arm.com/architectures/instruction-sets/intrinsics/vaeseq_u8
             "crypto.aese" => {
                 this.expect_target_feature_for_intrinsic(link_name, "aes")?;
                 let [state, key] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                aes_round(this, state, key, dest, |state, key| {
-                    let key = aes::Block::from(key.to_le_bytes());
-                    let mut state = aes::Block::from(state.to_le_bytes());
-                    // Same semantics as x86 AESENC round.
-                    aes::hazmat::cipher_round(&mut state, &key);
-                    u128::from_le_bytes(state.into())
-                })?;
+                assert_eq!(dest.layout.size, state.layout.size);
+                assert_eq!(dest.layout.size, key.layout.size);
+                let len = dest.layout.size.bytes() / 16;
+                assert!(dest.layout.size.bytes() % 16 == 0, "AESE expects 128-bit chunks");
+
+                let u128_array_layout =
+                    this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u128, len))?;
+                let state = state.transmute(u128_array_layout, this)?;
+                let key = key.transmute(u128_array_layout, this)?;
+                let dest = dest.transmute(u128_array_layout, this)?;
+
+                for i in 0..len {
+                    let s = this.read_scalar(&this.project_index(&state, i)?)?.to_u128()?;
+                    let k = this.read_scalar(&this.project_index(&key, i)?)?.to_u128()?;
+                    let mut block = aes::Block::from(s.to_le_bytes());
+                    // Perform cipher_round without MixColumns:
+                    // Do full round with zero key, undo MixColumns, then XOR actual key.
+                    aes::hazmat::cipher_round(&mut block, &aes::Block::from([0; 16]));
+                    aes::hazmat::inv_mix_columns(&mut block);
+                    let res = u128::from_le_bytes(block.into()) ^ k;
+                    this.write_scalar(Scalar::from_u128(res), &this.project_index(&dest, i)?)?;
+                }
             }
 
-            // AES single round decryption: `vaesdq_u8(data, key)`
-            // LLVM name: llvm.aarch64.crypto.aesd
+            // AES: AESD (InvSubBytes + InvShiftRows + AddRoundKey, without InvMixColumns).
+            // Combined with AESIMC equals a full decryption round.
+            // https://developer.arm.com/architectures/instruction-sets/intrinsics/vaesdq_u8
             "crypto.aesd" => {
                 this.expect_target_feature_for_intrinsic(link_name, "aes")?;
                 let [state, key] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                aes_round(this, state, key, dest, |state, key| {
-                    let key = aes::Block::from(key.to_le_bytes());
-                    let mut state = aes::Block::from(state.to_le_bytes());
-                    // Same semantics as x86 AESDEC round.
-                    aes::hazmat::equiv_inv_cipher_round(&mut state, &key);
-                    u128::from_le_bytes(state.into())
-                })?;
+                assert_eq!(dest.layout.size, state.layout.size);
+                assert_eq!(dest.layout.size, key.layout.size);
+                let len = dest.layout.size.bytes() / 16;
+                assert!(dest.layout.size.bytes() % 16 == 0, "AESD expects 128-bit chunks");
+
+                let u128_array_layout =
+                    this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u128, len))?;
+                let state = state.transmute(u128_array_layout, this)?;
+                let key = key.transmute(u128_array_layout, this)?;
+                let dest = dest.transmute(u128_array_layout, this)?;
+
+                for i in 0..len {
+                    let s = this.read_scalar(&this.project_index(&state, i)?)?.to_u128()?;
+                    let k = this.read_scalar(&this.project_index(&key, i)?)?.to_u128()?;
+                    let mut block = aes::Block::from(s.to_le_bytes());
+                    // Perform inv_cipher_round without InvMixColumns:
+                    // Do full inv round with zero key, undo InvMixColumns via MixColumns, then XOR actual key.
+                    aes::hazmat::equiv_inv_cipher_round(&mut block, &aes::Block::from([0; 16]));
+                    aes::hazmat::mix_columns(&mut block);
+                    let res = u128::from_le_bytes(block.into()) ^ k;
+                    this.write_scalar(Scalar::from_u128(res), &this.project_index(&dest, i)?)?;
+                }
             }
 
             _ => return interp_ok(EmulateItemResult::NotSupported),
